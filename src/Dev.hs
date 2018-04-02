@@ -46,13 +46,13 @@ instance (KnownSymbol symbol) => IsLabel symbol Expression where
 instance Num Expression where
   x + y = Application Addition [x,y]
   x * y = Application Multiplication [x,y]
-  x - y = Application Addition [x, Application Negation [y]]
-  negate x = Application Negation [x]
+  x - y = Application Addition [x, negate y]
+  negate x = Application (InverseUnder Addition) [x]
   fromInteger = Constant . fromInteger
 
 instance Fractional Expression where
   x / y = Application Multiplication [x, recip y]
-  recip x = Application Inversion [x]
+  recip x = Application (InverseUnder Multiplication) [x]
   fromRational = Constant . fromRational
 
 isConstant :: Expression -> Bool
@@ -65,8 +65,7 @@ value _            = Nothing
 
 data Operation = Addition
                | Multiplication
-               | Negation
-               | Inversion
+               | InverseUnder Operation
                | Exponentiation
                | Ln
                deriving (Eq, Generic)
@@ -75,12 +74,13 @@ instance Hashable Operation
 
 instance Show Operation where
   show = \case
-           Addition       -> "+"
-           Multiplication -> " "
-           Negation       -> "-"
-           Inversion      -> "^(-1)"
-           Exponentiation -> "^"
-           Ln             -> "ln"
+           Addition                    -> "+"
+           Multiplication              -> " "
+           InverseUnder Addition       -> "-"
+           InverseUnder Multiplication -> "^(-1)"
+           Exponentiation              -> "^"
+           Ln                          -> "ln"
+           InverseUnder op             -> error . toText $ "Undefined operation: inverse under " <> show op
 
 data Fixity = Prefix
             | Infix
@@ -90,8 +90,8 @@ data Fixity = Prefix
 operatorFixity :: Operation -> Fixity
 operatorFixity op
   | op `elem` [Addition, Multiplication, Exponentiation] = Infix
-  | op `elem` [Negation, Ln] = Prefix
-  | op `elem` [Inversion] = Postfix
+  | op `elem` [InverseUnder Addition, Ln] = Prefix
+  | op `elem` [InverseUnder Multiplication] = Postfix
   | otherwise = error . toText $ "Undefined fixity for operation: " <> show op
 
 data Property = Associative { getSide :: Side }
@@ -99,7 +99,7 @@ data Property = Associative { getSide :: Side }
               | Distributive { getOperation :: Operation }
               | Closure
               | Identity { getSide :: Side, getUnit :: Expression }
-              | Inverse { getOperation :: Operation }
+              | Inverses
               | Computable { getFunction :: [Scalar] -> Scalar }
               deriving (Eq)
 
@@ -121,7 +121,7 @@ structures =
                        , Commutative
                        , Closure
                        , Identity Left 0, Identity Right 0
-                       , Inverse Negation
+                       , Inverses
                        , Computable sum
                        ]
   , Structure Multiplication [ Associative Left, Associative Right
@@ -129,16 +129,16 @@ structures =
                              , Distributive Addition
                              , Closure
                              , Identity Left 1, Identity Right 1
-                             , Inverse Inversion
+                             , Inverses
                              , Computable product
                              ]
   ]
 
-structureByOp, structureByInverse :: Operation -> Maybe Structure
+structureByOp :: Operation -> Maybe Structure
 structureByOp op = find (\(Structure op' _) -> op == op') structures
-structureByInverse inv = find (\(Structure _ props) -> Inverse inv `elem` props) structures
 
-leftUnit, rightUnit :: Structure -> Maybe Expression
+unit, leftUnit, rightUnit :: Structure -> Maybe Expression
+unit = liftA2 (<|>) leftUnit rightUnit -- NB: if both left and right units exist, they must be identical
 leftUnit =
   map getUnit
   . find (\case
@@ -153,12 +153,8 @@ rightUnit =
   . properties
 
 inverse :: Structure -> Maybe Operation
-inverse =
-  map getOperation
-  . find (\case
-            Inverse _ -> True
-            _ -> False)
-  . properties
+inverse Structure{operation,properties} =
+  guard (Inverses `elem` properties) *> Just (InverseUnder operation)
 
 computable :: Structure -> Maybe ([Scalar] -> Scalar)
 computable =
@@ -188,19 +184,20 @@ removeRightUnitApplication _ = fail "rule not applicable"
 
 removeUnitApplication = liftA2 (<|>) removeLeftUnitApplication removeRightUnitApplication
 
-removeDoubleInverse (Application negO [Application negI [val]]) = maybeToList $ do
-  _ <- structureByInverse negO
-  guard $ negO == negI
+removeDoubleInverse (Application (InverseUnder opO) [Application (InverseUnder opI) [val]]) = maybeToList $ do
+  guard $ opO == opI
   pure val
 removeDoubleInverse _ = fail "rule not applicable"
 
-removeInverseApplication (Application op [x,y]) = maybeToList $ do
-  structure <- structureByOp op
-  unit <- leftUnit structure
-  inverse <- inverse structure
-  let xinv = Application inverse [x]
-  xinv' <- safeHead $ removeDoubleInverse xinv <|> pure xinv
-  guard $ xinv' == y
+removeInverseApplication (Application opO [Application (InverseUnder opI) [x], y]) = maybeToList $ do
+  unit <- unit =<< structureByOp opO
+  guard $ opO == opI
+  guard $ x == y
+  pure unit
+removeInverseApplication (Application opO [x, Application (InverseUnder opI) [y]]) = maybeToList $ do
+  unit <- unit =<< structureByOp opO
+  guard $ opO == opI
+  guard $ x == y
   pure unit
 removeInverseApplication _ = fail "rule not applicable"
 
